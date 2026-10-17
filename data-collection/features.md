@@ -1,6 +1,6 @@
 # Features
 
-Every column written to the Parquet feature matrix, one row per transaction.
+Every column of the `txs` table after `block_height` and `tx_index`, one row per transaction.
 Coinbase transactions are skipped during the scan and have no rows.
 The column order is pinned by `src/analysis/schema_columns.txt` (checked by the
 `schema_matches_golden` test); `cargo run -- schema` prints the same list.
@@ -135,7 +135,7 @@ OP_RETURN. Transactions with ≤1 payment output get no candidates.
 
 ## Collected but not in the matrix
 
-`TxAnalysis` also records these, which are not encoded into Parquet columns:
+`TxAnalysis` also records these, which are not encoded into `txs` columns:
 `block_hash`, per-signature algorithm, sighash flag byte and low-R, per-pubkey
 details, the full list of multisig m-of-n configurations (`multisig_configs`;
 only the largest m and n are encoded), and change candidate vouts/values.
