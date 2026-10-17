@@ -344,7 +344,12 @@ fn format_duration(secs: u64) -> String {
 /// format is a new impl rather than a change to the block walk.
 trait RowSink {
     /// Accept one row. `columns` is the feature schema `norm.x` is aligned with.
-    fn push(&mut self, norm: &NormalizedTx, columns: &[String]) -> Result<(), String>;
+    fn push(
+        &mut self,
+        tx_index: i32,
+        norm: &NormalizedTx,
+        columns: &[String],
+    ) -> Result<(), String>;
 
     /// Flush anything buffered and close the output, returning rows written.
     fn finish(self: Box<Self>) -> Result<u64, String>;
@@ -363,6 +368,7 @@ fn write_schema(path: &Path) -> Result<(), String> {
 /// Column-major staging buffer for one Parquet row group.
 struct ParquetRows {
     block_height: Vec<i32>,
+    tx_index: Vec<i32>,
     int_names: Vec<String>,
     int_cols: Vec<Vec<i32>>,
     bool_names: Vec<String>,
@@ -379,6 +385,7 @@ impl ParquetRows {
         let bool_cols = vec![Vec::new(); bool_names.len()];
         Self {
             block_height: Vec::new(),
+            tx_index: Vec::new(),
             int_names,
             int_cols,
             bool_names,
@@ -394,8 +401,10 @@ impl ParquetRows {
     ///
     /// Declared up front so every row group in the file shares one schema.
     fn polars_schema(&self) -> Schema {
-        let mut fields: Vec<(PlSmallStr, DataType)> =
-            vec![("block_height".into(), DataType::Int32)];
+        let mut fields: Vec<(PlSmallStr, DataType)> = vec![
+            ("block_height".into(), DataType::Int32),
+            ("tx_index".into(), DataType::Int32),
+        ];
         fields.extend(
             self.int_names
                 .iter()
@@ -409,7 +418,12 @@ impl ParquetRows {
         Schema::from_iter(fields)
     }
 
-    fn push(&mut self, norm: &NormalizedTx, columns: &[String]) -> Result<(), String> {
+    fn push(
+        &mut self,
+        tx_index: i32,
+        norm: &NormalizedTx,
+        columns: &[String],
+    ) -> Result<(), String> {
         if norm.x.len() != columns.len() {
             return Err(format!(
                 "feature width {} != schema {}",
@@ -418,6 +432,7 @@ impl ParquetRows {
             ));
         }
         self.block_height.push(norm.block_height);
+        self.tx_index.push(tx_index);
 
         let (mut int_i, mut bool_i) = (0, 0);
         for (name, value) in columns.iter().zip(norm.x.iter()) {
@@ -442,6 +457,7 @@ impl ParquetRows {
                 std::mem::take(&mut self.block_height),
             )
             .into(),
+            Series::new("tx_index".into(), std::mem::take(&mut self.tx_index)).into(),
         ];
         for (name, values) in self.int_names.iter().zip(self.int_cols.iter_mut()) {
             cols.push(Series::new(name.as_str().into(), std::mem::take(values)).into());
@@ -496,8 +512,13 @@ impl ParquetSink {
 }
 
 impl RowSink for ParquetSink {
-    fn push(&mut self, norm: &NormalizedTx, columns: &[String]) -> Result<(), String> {
-        self.rows.push(norm, columns)?;
+    fn push(
+        &mut self,
+        tx_index: i32,
+        norm: &NormalizedTx,
+        columns: &[String],
+    ) -> Result<(), String> {
+        self.rows.push(tx_index, norm, columns)?;
         if self.rows.len() >= self.batch_size {
             self.flush()?;
         }
@@ -587,7 +608,7 @@ fn analyze_block(
     // Analysis is pure over owned data, so it fans out across the block's txs.
     // `collect` keeps rows in block order. Coinbase txs are built by pool
     // software rather than a wallet, so they are not part of the output.
-    let rows: Vec<Result<NormalizedTx, String>> = txs
+    let rows: Vec<Result<(i32, NormalizedTx), String>> = txs
         .par_iter()
         .zip(prevouts.par_iter())
         .zip(block_ctxs.par_iter())
@@ -595,7 +616,7 @@ fn analyze_block(
         .filter(|(_, ((tx, _), _))| !tx.is_coinbase())
         .map(|(tx_index, ((tx, prevouts), block_ctx))| {
             match analyze_tx(tx, prevouts, height, &block_hash, block_ctx) {
-                Ok(analysis) => Ok(normalize_tx(&analysis)),
+                Ok(analysis) => Ok((tx_index as i32, normalize_tx(&analysis))),
                 // Reported back to the caller rather than printed here: this
                 // closure runs on rayon threads, where prints interleave.
                 Err(err) => Err(format!("tx {block_hash}:{tx_index}: {err}")),
@@ -603,11 +624,14 @@ fn analyze_block(
         })
         .collect();
 
-    let mut outcome = BlockOutcome::default();
+    let mut outcome = BlockOutcome {
+        tx_count: txs.len() as u64,
+        ..Default::default()
+    };
     for row in &rows {
         match row {
-            Ok(norm) => {
-                sink.push(norm, &schema_ref().columns)?;
+            Ok((tx_index, norm)) => {
+                sink.push(*tx_index, norm, &schema_ref().columns)?;
                 outcome.rows += 1;
             }
             Err(err) => {
@@ -625,6 +649,8 @@ fn analyze_block(
 /// What one block contributed to the scan.
 #[derive(Debug, Default)]
 struct BlockOutcome {
+    /// Every tx in the block, coinbase included.
+    tx_count: u64,
     rows: u64,
     skipped: u64,
     /// One sample error, so a run can show *why* txs are being skipped without
@@ -695,7 +721,7 @@ mod tests {
         let mut sink: Box<dyn RowSink> =
             Box::new(ParquetSink::new(path, columns, batch_size).unwrap());
         for i in 0..n {
-            sink.push(&row(i, columns), columns).unwrap();
+            sink.push(i as i32 + 1, &row(i, columns), columns).unwrap();
         }
         assert_eq!(sink.finish().unwrap(), n as u64);
 
@@ -721,6 +747,8 @@ mod tests {
         let heights = streamed.column("block_height").unwrap().i32().unwrap();
         assert_eq!(heights.get(0), Some(0));
         assert_eq!(heights.get(249), Some(249));
+        let tx_index = streamed.column("tx_index").unwrap().i32().unwrap();
+        assert_eq!(tx_index.get(249), Some(250));
     }
 
     /// A partial trailing batch must still be flushed by `finish`.
@@ -740,6 +768,6 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let df = write_rows(&dir.join("empty.parquet"), 0, 16);
         assert_eq!(df.shape().0, 0);
-        assert_eq!(df.width(), schema_ref().columns.len() + 1);
+        assert_eq!(df.width(), schema_ref().columns.len() + 2);
     }
 }
