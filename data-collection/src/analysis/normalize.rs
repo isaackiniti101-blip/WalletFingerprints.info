@@ -285,7 +285,7 @@ mod tests {
     /// `cargo run -- schema | jq -r '.columns[]' > src/analysis/schema_columns.txt`
     const GOLDEN: &str = include_str!("schema_columns.txt");
 
-    /// The feature vector's column order is a wire format: every Parquet file
+    /// The feature vector's column order is a wire format: every scan file
     /// ever written is only interpretable against it. Reordering or renaming a
     /// column silently invalidates historical output, so it has to be a
     /// deliberate, reviewed change to the golden file.
@@ -306,8 +306,7 @@ mod tests {
         );
     }
 
-    /// Duplicate names would make a column ambiguous downstream (and Parquet
-    /// would happily write both).
+    /// Duplicate names would make a column ambiguous downstream.
     #[test]
     fn schema_columns_are_unique() {
         let cols = &schema_ref().columns;

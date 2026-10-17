@@ -1,8 +1,6 @@
 mod analysis;
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -17,12 +15,11 @@ use bitcoinkernel::{
     BlockTreeEntry, ChainType, ChainstateManager, ChainstateManagerBuilder, Context,
     ContextBuilder, prelude::*,
 };
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use duckdb::arrow::array::{ArrayRef, BooleanArray, Int32Array};
 use duckdb::arrow::datatypes::{DataType, Field, Schema};
 use duckdb::arrow::record_batch::RecordBatch;
 use duckdb::{Connection, params};
-use polars::prelude::*;
 use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -48,10 +45,6 @@ impl From<CliChainType> for ChainType {
 /// so silence is indistinguishable from a hang.
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Rows buffered per Parquet row group. At ~123 boolean columns this is on the
-/// order of 120MB of staging memory, near the usual Parquet row-group target.
-const DEFAULT_BATCH_SIZE: usize = 1_000_000;
-
 /// Rows buffered before a commit. Matches DuckDB's row-group size, since each
 /// commit closes the open row group and smaller commits leave them half full.
 const COMMIT_ROWS: usize = 122_880;
@@ -70,44 +63,44 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Walk blocks from tip, analyze each tx, and write a normalized Parquet feature matrix.
-    Scan(ScanArgs),
+    /// Start a new scan from the tip down, writing it to a new DuckDB file.
+    Start(StartArgs),
+    /// Continue an unfinished scan where its last commit left off.
+    Resume(ResumeArgs),
     /// Print the normalized feature column schema as JSON.
     Schema,
 }
 
-#[derive(Debug, Parser)]
-struct ScanArgs {
+/// Where the node's data and the scan file live. Machine paths, so they are
+/// passed on every run rather than stored with the scan.
+#[derive(Debug, Args)]
+struct NodeArgs {
     /// Path to a Bitcoin Core data directory readable by libbitcoinkernel.
     data_dir: String,
-    /// How many blocks to walk back from the tip (inclusive of tip).
-    /// Omit to scan all the way to genesis.
-    #[arg(long, conflicts_with_all = ["start_height", "end_height"])]
-    depth: Option<u32>,
-    /// Lowest block height to scan (inclusive). Defaults to genesis.
-    #[arg(long)]
-    start_height: Option<u32>,
-    /// Highest block height to scan (inclusive). Defaults to the tip.
-    ///
-    /// With `--start-height`, this makes a run restartable: a walk that died at
-    /// height N resumes with `--end-height N`.
-    #[arg(long)]
-    end_height: Option<u32>,
-    /// Network the data directory belongs to.
-    #[arg(long, value_enum, default_value_t = CliChainType::Regtest)]
-    chain: CliChainType,
+    /// DuckDB file holding the scan.
+    db: PathBuf,
     /// Optional override for the blocks directory (defaults to `<data_dir>/blocks`).
     #[arg(long)]
     blocks_dir: Option<String>,
-    /// Destination Parquet file for the feature matrix.
-    #[arg(short, long)]
-    output: PathBuf,
-    /// Optional path to write the column schema JSON.
+}
+
+#[derive(Debug, Parser)]
+struct StartArgs {
+    #[command(flatten)]
+    node: NodeArgs,
+    /// How many blocks to scan back from the tip (inclusive of tip).
+    /// Omit to scan all the way to genesis.
     #[arg(long)]
-    schema_out: Option<PathBuf>,
-    /// Rows per Parquet row group. Caps how much is held in memory at once.
-    #[arg(long, default_value_t = DEFAULT_BATCH_SIZE)]
-    batch_size: usize,
+    depth: Option<u32>,
+    /// Network the data directory belongs to.
+    #[arg(long, value_enum, default_value_t = CliChainType::Regtest)]
+    chain: CliChainType,
+}
+
+#[derive(Debug, Parser)]
+struct ResumeArgs {
+    #[command(flatten)]
+    node: NodeArgs,
 }
 
 fn main() -> ExitCode {
@@ -120,7 +113,8 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     match Cli::parse().command {
-        Command::Scan(args) => run_scan(args),
+        Command::Start(args) => run_start(args),
+        Command::Resume(args) => run_resume(args),
         Command::Schema => {
             let schema = schema();
             println!(
@@ -141,58 +135,20 @@ fn create_context(chain: ChainType) -> Result<Arc<Context>, String> {
         .map_err(|e| format!("failed to build kernel context: {e}"))
 }
 
-fn run_scan(args: ScanArgs) -> Result<(), String> {
+fn run_start(args: StartArgs) -> Result<(), String> {
     if matches!(args.depth, Some(0)) {
         return Err("depth must be >= 1 (omit --depth to scan to genesis)".into());
     }
-
-    if args.batch_size == 0 {
-        return Err("--batch-size must be >= 1".into());
+    // Checked before spending minutes importing blocks.
+    if args.node.db.exists() {
+        return Err(already_started(&args.node));
     }
-    if let Some(path) = &args.schema_out {
-        write_schema(path)?;
-    }
-
-    // Open the sink before spending minutes importing blocks, so a bad output
-    // path fails immediately rather than after the walk.
-    let columns = &schema_ref().columns;
-    let mut sink: Box<dyn RowSink> =
-        Box::new(ParquetSink::new(&args.output, columns, args.batch_size)?);
 
     let context = create_context(args.chain.into())?;
-    let blocks_dir = args
-        .blocks_dir
-        .unwrap_or_else(|| format!("{}/blocks", args.data_dir));
-
-    let chainman = ChainstateManagerBuilder::new(&context, &args.data_dir, &blocks_dir)
-        .map_err(|e| format!("chainstate manager builder: {e}"))?
-        .build()
-        .map_err(|e| format!("chainstate manager build: {e}"))?;
-
-    chainman
-        .import_blocks()
-        .map_err(|e| format!("import_blocks: {e}"))?;
-
-    let tip = chainman
-        .best_entry()
-        .ok_or_else(|| "no best block entry (empty chain?)".to_string())?;
-    let tip_height = tip.height();
-
-    let end_height = match args.end_height {
-        Some(end) => {
-            let end = end as i32;
-            if end > tip_height {
-                return Err(format!(
-                    "--end-height {end} is above the tip at {tip_height}"
-                ));
-            }
-            end
-        }
-        None => tip_height,
-    };
-    let start_height = match (args.start_height, args.depth) {
-        (Some(start), _) => start as i32,
-        (None, Some(depth)) => {
+    let chainman = load_chainman(&context, &args.node)?;
+    let tip_height = tip_height(&chainman)?;
+    let start_height = match args.depth {
+        Some(depth) => {
             let chain_len = tip_height as i64 + 1;
             if depth as i64 > chain_len {
                 return Err(format!(
@@ -201,41 +157,126 @@ fn run_scan(args: ScanArgs) -> Result<(), String> {
             }
             tip_height - (depth as i32 - 1)
         }
-        (None, None) => 0,
+        None => 0,
     };
-    if start_height > end_height {
+
+    let range = ScanRange {
+        chain: args.chain,
+        start_height,
+        end_height: tip_height,
+    };
+    let sink = DuckDbSink::create(&args.node.db, &range, &schema_ref().columns)?;
+    walk(
+        &chainman,
+        tip_height,
+        start_height,
+        Box::new(sink),
+        &args.node.db,
+    )
+}
+
+fn already_started(node: &NodeArgs) -> String {
+    format!(
+        "{} already holds a scan; continue it with `resume {} {}`",
+        node.db.display(),
+        node.data_dir,
+        node.db.display()
+    )
+}
+
+fn run_resume(args: ResumeArgs) -> Result<(), String> {
+    let (sink, state) = DuckDbSink::open(&args.node.db, &schema_ref().columns)?;
+
+    let context = create_context(state.range.chain.into())?;
+    let chainman = load_chainman(&context, &args.node)?;
+    let tip_height = tip_height(&chainman)?;
+    if tip_height < state.range.end_height {
         return Err(format!(
-            "--start-height {start_height} is above --end-height {end_height}"
+            "chain tip {tip_height} is below the scan's end height {}",
+            state.range.end_height
         ));
     }
 
-    // Walk down from the tip to the requested range. `prev()` only follows the
-    // block index, so skipping ahead of the range costs no block reads.
-    let mut entry = tip;
-    while entry.height() > end_height {
-        entry = entry
-            .prev()
-            .ok_or_else(|| format!("chain ended before reaching height {end_height}"))?;
-    }
+    let from = match &state.lowest_done {
+        Some((height, hash)) => {
+            // A wrong data_dir would silently mix chains; the stored hash catches it.
+            let entry = chainman
+                .active_chain()
+                .at_height(*height as usize)
+                .ok_or_else(|| format!("no block at height {height} on this node"))?;
+            let node_hash = entry.block_hash().to_string();
+            if node_hash != *hash {
+                return Err(format!(
+                    "block {height} is {node_hash} on this node but {hash} in {}; wrong data_dir?",
+                    args.node.db.display()
+                ));
+            }
+            height - 1
+        }
+        None => state.range.end_height,
+    };
+    walk(
+        &chainman,
+        from,
+        state.range.start_height,
+        Box::new(sink),
+        &args.node.db,
+    )
+}
+
+fn load_chainman(context: &Context, node: &NodeArgs) -> Result<ChainstateManager, String> {
+    let blocks_dir = node
+        .blocks_dir
+        .clone()
+        .unwrap_or_else(|| format!("{}/blocks", node.data_dir));
+    let chainman = ChainstateManagerBuilder::new(context, &node.data_dir, &blocks_dir)
+        .map_err(|e| format!("chainstate manager builder: {e}"))?
+        .build()
+        .map_err(|e| format!("chainstate manager build: {e}"))?;
+    chainman
+        .import_blocks()
+        .map_err(|e| format!("import_blocks: {e}"))?;
+    Ok(chainman)
+}
+
+fn tip_height(chainman: &ChainstateManager) -> Result<i32, String> {
+    chainman
+        .best_entry()
+        .map(|tip| tip.height())
+        .ok_or_else(|| "no best block entry (empty chain?)".to_string())
+}
+
+/// Analyze blocks from `from` down to `to` (both inclusive) into `sink`.
+fn walk(
+    chainman: &ChainstateManager,
+    from: i32,
+    to: i32,
+    mut sink: Box<dyn RowSink>,
+    db: &Path,
+) -> Result<(), String> {
+    let chain = chainman.active_chain();
+    let mut entry = chain
+        .at_height(from as usize)
+        .ok_or_else(|| format!("no block at height {from} on this node"))?;
 
     eprintln!(
         "scanning {} block(s) from height {} to {} ({})",
-        end_height.saturating_sub(start_height) + 1,
-        start_height,
-        end_height,
+        from - to + 1,
+        to,
+        from,
         entry.block_hash()
     );
 
-    let total_blocks = (end_height.saturating_sub(start_height) + 1) as u64;
+    let total_blocks = (from - to + 1) as u64;
     let mut progress = Progress::new(total_blocks);
 
     loop {
         let height = entry.height();
-        if height < start_height {
+        if height < to {
             break;
         }
 
-        let outcome = analyze_block(&chainman, &entry, sink.as_mut())?;
+        let outcome = analyze_block(chainman, &entry, sink.as_mut())?;
         sink.end_block(&outcome)?;
         progress.record(height, &outcome);
 
@@ -250,7 +291,7 @@ fn run_scan(args: ScanArgs) -> Result<(), String> {
 
     let rows = sink.finish()?;
     progress.finish();
-    eprintln!("wrote {} ({rows} rows)", args.output.display());
+    eprintln!("wrote {} ({rows} rows)", db.display());
     Ok(())
 }
 
@@ -353,7 +394,7 @@ fn format_duration(secs: u64) -> String {
 
 /// Destination for normalized feature rows.
 ///
-/// One implementation per output format; `scan` holds it boxed so adding a
+/// One implementation per output format; `walk` holds it boxed so adding a
 /// format is a new impl rather than a change to the block walk.
 trait RowSink {
     /// Accept one row. `columns` is the feature schema `norm.x` is aligned with.
@@ -387,17 +428,7 @@ struct ResumeState {
     lowest_done: Option<(i32, String)>,
 }
 
-fn write_schema(path: &Path) -> Result<(), String> {
-    let mut f = File::create(path).map_err(|e| format!("schema_out: {e}"))?;
-    writeln!(
-        f,
-        "{}",
-        serde_json::to_string_pretty(schema_ref()).map_err(|e| format!("schema json: {e}"))?
-    )
-    .map_err(|e| format!("schema write: {e}"))
-}
-
-/// Column-major staging buffer for the next Parquet row group or `txs` commit.
+/// Column-major staging buffer for the next `txs` commit.
 struct RowBuffer {
     block_height: Vec<i32>,
     tx_index: Vec<i32>,
@@ -427,29 +458,6 @@ impl RowBuffer {
 
     fn len(&self) -> usize {
         self.block_height.len()
-    }
-
-    /// Polars schema of the frames produced by [`RowBuffer::take_frame`].
-    ///
-    /// Declared up front so every row group in the file shares one schema.
-    fn polars_schema(&self) -> polars::prelude::Schema {
-        // The arrow imports used by `take_batch` shadow polars' names.
-        use polars::prelude::{DataType, Schema};
-        let mut fields: Vec<(PlSmallStr, DataType)> = vec![
-            ("block_height".into(), DataType::Int32),
-            ("tx_index".into(), DataType::Int32),
-        ];
-        fields.extend(
-            self.int_names
-                .iter()
-                .map(|name| (name.as_str().into(), DataType::Int32)),
-        );
-        fields.extend(
-            self.bool_names
-                .iter()
-                .map(|name| (name.as_str().into(), DataType::Boolean)),
-        );
-        Schema::from_iter(fields)
     }
 
     /// `txs` columns as (name, DuckDB type), in table order.
@@ -495,27 +503,6 @@ impl RowBuffer {
         Ok(())
     }
 
-    /// Drain the buffered rows into a frame, leaving the buffer empty and reusable.
-    ///
-    /// Column order must match [`RowBuffer::polars_schema`].
-    fn take_frame(&mut self) -> Result<DataFrame, String> {
-        let mut cols: Vec<Column> = vec![
-            Series::new(
-                "block_height".into(),
-                std::mem::take(&mut self.block_height),
-            )
-            .into(),
-            Series::new("tx_index".into(), std::mem::take(&mut self.tx_index)).into(),
-        ];
-        for (name, values) in self.int_names.iter().zip(self.int_cols.iter_mut()) {
-            cols.push(Series::new(name.as_str().into(), std::mem::take(values)).into());
-        }
-        for (name, values) in self.bool_names.iter().zip(self.bool_cols.iter_mut()) {
-            cols.push(Series::new(name.as_str().into(), std::mem::take(values)).into());
-        }
-        DataFrame::new(cols).map_err(|e| format!("dataframe: {e}"))
-    }
-
     /// Drain the buffered rows into a record batch, leaving the buffer empty and reusable.
     fn take_batch(&mut self) -> Result<RecordBatch, String> {
         let mut arrays: Vec<ArrayRef> = vec![
@@ -542,79 +529,6 @@ impl RowBuffer {
             .collect();
         RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
             .map_err(|e| format!("record batch: {e}"))
-    }
-}
-
-/// Streams feature rows to Parquet one row group at a time.
-///
-/// Only `batch_size` rows are held in memory, so a full-chain walk costs a
-/// bounded amount of RAM regardless of how many transactions it visits.
-struct ParquetSink {
-    writer: BatchedWriter<BufWriter<File>>,
-    rows: RowBuffer,
-    batch_size: usize,
-    written: u64,
-}
-
-impl ParquetSink {
-    fn new(path: &Path, columns: &[String], batch_size: usize) -> Result<Self, String> {
-        let rows = RowBuffer::new(columns);
-        let schema = rows.polars_schema();
-        let file = File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
-        let writer = ParquetWriter::new(BufWriter::new(file))
-            .batched(&schema)
-            .map_err(|e| format!("parquet writer: {e}"))?;
-        Ok(Self {
-            writer,
-            rows,
-            batch_size,
-            written: 0,
-        })
-    }
-
-    /// Write the buffered rows as one row group.
-    fn flush(&mut self) -> Result<(), String> {
-        let n = self.rows.len();
-        if n == 0 {
-            return Ok(());
-        }
-        let frame = self.rows.take_frame()?;
-        self.writer
-            .write_batch(&frame)
-            .map_err(|e| format!("parquet row group: {e}"))?;
-        self.written += n as u64;
-        Ok(())
-    }
-}
-
-impl RowSink for ParquetSink {
-    fn push(
-        &mut self,
-        tx_index: i32,
-        norm: &NormalizedTx,
-        columns: &[String],
-    ) -> Result<(), String> {
-        self.rows.push(tx_index, norm, columns)?;
-        if self.rows.len() >= self.batch_size {
-            self.flush()?;
-        }
-        Ok(())
-    }
-
-    /// Row groups are sized by row count, not blocks.
-    fn end_block(&mut self, _block: &BlockOutcome) -> Result<(), String> {
-        Ok(())
-    }
-
-    /// Flush the tail and write the file footer.
-    ///
-    /// With no rows at all this still emits a valid empty file carrying the schema.
-    fn finish(mut self: Box<Self>) -> Result<u64, String> {
-        self.flush()?;
-        self.writer
-            .finish()
-            .map_err(|e| format!("parquet footer: {e}"))?;
-        Ok(self.written)
     }
 }
 
@@ -1096,63 +1010,6 @@ mod tests {
             .unwrap()
             .query_row(sql, [], |r| r.get(0))
             .unwrap()
-    }
-
-    fn write_rows(path: &Path, n: usize, batch_size: usize) -> DataFrame {
-        let columns = &schema_ref().columns;
-        // Exercise it through the trait object, the way `scan` drives it.
-        let mut sink: Box<dyn RowSink> =
-            Box::new(ParquetSink::new(path, columns, batch_size).unwrap());
-        for i in 0..n {
-            sink.push(i as i32 + 1, &row(i as i32, i, columns), columns)
-                .unwrap();
-        }
-        assert_eq!(sink.finish().unwrap(), n as u64);
-
-        ParquetReader::new(File::open(path).unwrap())
-            .finish()
-            .unwrap()
-    }
-
-    /// Row-group size must not change the data that comes back out.
-    #[test]
-    fn batching_does_not_change_contents() {
-        let dir = std::env::temp_dir().join("kp_parquet_stream_test");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let streamed = write_rows(&dir.join("many.parquet"), 250, 7);
-        let single = write_rows(&dir.join("one.parquet"), 250, 10_000);
-
-        assert_eq!(streamed.shape(), single.shape());
-        assert_eq!(streamed.shape().0, 250);
-        assert!(streamed.equals(&single), "row groups changed the contents");
-
-        // Metadata columns survived the round trip in order.
-        let heights = streamed.column("block_height").unwrap().i32().unwrap();
-        assert_eq!(heights.get(0), Some(0));
-        assert_eq!(heights.get(249), Some(249));
-        let tx_index = streamed.column("tx_index").unwrap().i32().unwrap();
-        assert_eq!(tx_index.get(249), Some(250));
-    }
-
-    /// A partial trailing batch must still be flushed by `finish`.
-    #[test]
-    fn trailing_partial_batch_is_written() {
-        let dir = std::env::temp_dir().join("kp_parquet_stream_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        // 10 rows at batch 4 => 2 full groups + a 2-row tail.
-        let df = write_rows(&dir.join("tail.parquet"), 10, 4);
-        assert_eq!(df.shape().0, 10);
-    }
-
-    /// Zero rows must still produce a readable file carrying the schema.
-    #[test]
-    fn empty_input_writes_valid_file() {
-        let dir = std::env::temp_dir().join("kp_parquet_stream_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let df = write_rows(&dir.join("empty.parquet"), 0, 16);
-        assert_eq!(df.shape().0, 0);
-        assert_eq!(df.width(), schema_ref().columns.len() + 2);
     }
 
     /// A scan killed after a few commits and resumed must equal one that ran straight through.
