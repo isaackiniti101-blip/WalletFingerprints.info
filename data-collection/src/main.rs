@@ -224,6 +224,7 @@ fn run_scan(args: ScanArgs) -> Result<(), String> {
         }
 
         let outcome = analyze_block(&chainman, &entry, sink.as_mut())?;
+        sink.end_block(&outcome)?;
         progress.record(height, &outcome);
 
         if height == 0 {
@@ -350,6 +351,9 @@ trait RowSink {
         norm: &NormalizedTx,
         columns: &[String],
     ) -> Result<(), String>;
+
+    /// Mark `block` done. Every row pushed since the previous call belongs to it.
+    fn end_block(&mut self, block: &BlockOutcome) -> Result<(), String>;
 
     /// Flush anything buffered and close the output, returning rows written.
     fn finish(self: Box<Self>) -> Result<u64, String>;
@@ -525,6 +529,11 @@ impl RowSink for ParquetSink {
         Ok(())
     }
 
+    /// Row groups are sized by row count, not blocks.
+    fn end_block(&mut self, _block: &BlockOutcome) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Flush the tail and write the file footer.
     ///
     /// With no rows at all this still emits a valid empty file carrying the schema.
@@ -625,7 +634,9 @@ fn analyze_block(
         .collect();
 
     let mut outcome = BlockOutcome {
+        height,
         tx_count: txs.len() as u64,
+        hash: block_hash,
         ..Default::default()
     };
     for row in &rows {
@@ -649,6 +660,8 @@ fn analyze_block(
 /// What one block contributed to the scan.
 #[derive(Debug, Default)]
 struct BlockOutcome {
+    height: i32,
+    hash: String,
     /// Every tx in the block, coinbase included.
     tx_count: u64,
     rows: u64,
