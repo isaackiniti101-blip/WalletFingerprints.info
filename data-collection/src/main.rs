@@ -18,6 +18,10 @@ use bitcoinkernel::{
     ContextBuilder, prelude::*,
 };
 use clap::{Parser, Subcommand, ValueEnum};
+use duckdb::arrow::array::{ArrayRef, BooleanArray, Int32Array};
+use duckdb::arrow::datatypes::{DataType, Field, Schema};
+use duckdb::arrow::record_batch::RecordBatch;
+use duckdb::{Connection, params};
 use polars::prelude::*;
 use rayon::prelude::*;
 
@@ -47,6 +51,14 @@ const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 /// Rows buffered per Parquet row group. At ~123 boolean columns this is on the
 /// order of 120MB of staging memory, near the usual Parquet row-group target.
 const DEFAULT_BATCH_SIZE: usize = 1_000_000;
+
+/// Rows buffered before a commit. Matches DuckDB's row-group size, since each
+/// commit closes the open row group and smaller commits leave them half full.
+const COMMIT_ROWS: usize = 122_880;
+
+/// Longest stretch between commits. Early blocks are coinbase-only and write no
+/// rows, so the row threshold alone could leave hours of work uncommitted.
+const COMMIT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Bitcoin tx fingerprint scanner and feature normalizer.
 #[derive(Debug, Parser)]
@@ -359,6 +371,22 @@ trait RowSink {
     fn finish(self: Box<Self>) -> Result<u64, String>;
 }
 
+/// The heights a scan covers, fixed when it starts.
+#[derive(Debug, Clone, Copy)]
+struct ScanRange {
+    chain: CliChainType,
+    start_height: i32,
+    end_height: i32,
+}
+
+/// What a resume needs from an existing scan file.
+#[derive(Debug)]
+struct ResumeState {
+    range: ScanRange,
+    /// Lowest done block and its hash; `None` if no block was committed yet.
+    lowest_done: Option<(i32, String)>,
+}
+
 fn write_schema(path: &Path) -> Result<(), String> {
     let mut f = File::create(path).map_err(|e| format!("schema_out: {e}"))?;
     writeln!(
@@ -369,8 +397,8 @@ fn write_schema(path: &Path) -> Result<(), String> {
     .map_err(|e| format!("schema write: {e}"))
 }
 
-/// Column-major staging buffer for one Parquet row group.
-struct ParquetRows {
+/// Column-major staging buffer for the next Parquet row group or `txs` commit.
+struct RowBuffer {
     block_height: Vec<i32>,
     tx_index: Vec<i32>,
     int_names: Vec<String>,
@@ -379,7 +407,7 @@ struct ParquetRows {
     bool_cols: Vec<Vec<bool>>,
 }
 
-impl ParquetRows {
+impl RowBuffer {
     fn new(columns: &[String]) -> Self {
         let (int_names, bool_names): (Vec<String>, Vec<String>) = columns
             .iter()
@@ -401,10 +429,12 @@ impl ParquetRows {
         self.block_height.len()
     }
 
-    /// Polars schema of the frames produced by [`ParquetRows::take_frame`].
+    /// Polars schema of the frames produced by [`RowBuffer::take_frame`].
     ///
     /// Declared up front so every row group in the file shares one schema.
-    fn polars_schema(&self) -> Schema {
+    fn polars_schema(&self) -> polars::prelude::Schema {
+        // The arrow imports used by `take_batch` shadow polars' names.
+        use polars::prelude::{DataType, Schema};
         let mut fields: Vec<(PlSmallStr, DataType)> = vec![
             ("block_height".into(), DataType::Int32),
             ("tx_index".into(), DataType::Int32),
@@ -420,6 +450,20 @@ impl ParquetRows {
                 .map(|name| (name.as_str().into(), DataType::Boolean)),
         );
         Schema::from_iter(fields)
+    }
+
+    /// `txs` columns as (name, DuckDB type), in table order.
+    ///
+    /// The appender maps record-batch columns by position, so this order must
+    /// match [`RowBuffer::take_batch`].
+    fn sql_columns(&self) -> Vec<(String, &'static str)> {
+        let mut cols = vec![
+            ("block_height".to_string(), "INTEGER"),
+            ("tx_index".to_string(), "INTEGER"),
+        ];
+        cols.extend(self.int_names.iter().map(|n| (n.clone(), "INTEGER")));
+        cols.extend(self.bool_names.iter().map(|n| (n.clone(), "BOOLEAN")));
+        cols
     }
 
     fn push(
@@ -453,7 +497,7 @@ impl ParquetRows {
 
     /// Drain the buffered rows into a frame, leaving the buffer empty and reusable.
     ///
-    /// Column order must match [`ParquetRows::polars_schema`].
+    /// Column order must match [`RowBuffer::polars_schema`].
     fn take_frame(&mut self) -> Result<DataFrame, String> {
         let mut cols: Vec<Column> = vec![
             Series::new(
@@ -471,6 +515,34 @@ impl ParquetRows {
         }
         DataFrame::new(cols).map_err(|e| format!("dataframe: {e}"))
     }
+
+    /// Drain the buffered rows into a record batch, leaving the buffer empty and reusable.
+    fn take_batch(&mut self) -> Result<RecordBatch, String> {
+        let mut arrays: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(std::mem::take(&mut self.block_height))),
+            Arc::new(Int32Array::from(std::mem::take(&mut self.tx_index))),
+        ];
+        for values in &mut self.int_cols {
+            arrays.push(Arc::new(Int32Array::from(std::mem::take(values))));
+        }
+        for values in &mut self.bool_cols {
+            arrays.push(Arc::new(BooleanArray::from(std::mem::take(values))));
+        }
+        let fields: Vec<Field> = self
+            .sql_columns()
+            .into_iter()
+            .map(|(name, ty)| {
+                let ty = if ty == "BOOLEAN" {
+                    DataType::Boolean
+                } else {
+                    DataType::Int32
+                };
+                Field::new(name, ty, false)
+            })
+            .collect();
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(|e| format!("record batch: {e}"))
+    }
 }
 
 /// Streams feature rows to Parquet one row group at a time.
@@ -479,14 +551,14 @@ impl ParquetRows {
 /// bounded amount of RAM regardless of how many transactions it visits.
 struct ParquetSink {
     writer: BatchedWriter<BufWriter<File>>,
-    rows: ParquetRows,
+    rows: RowBuffer,
     batch_size: usize,
     written: u64,
 }
 
 impl ParquetSink {
     fn new(path: &Path, columns: &[String], batch_size: usize) -> Result<Self, String> {
-        let rows = ParquetRows::new(columns);
+        let rows = RowBuffer::new(columns);
         let schema = rows.polars_schema();
         let file = File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
         let writer = ParquetWriter::new(BufWriter::new(file))
@@ -542,6 +614,253 @@ impl RowSink for ParquetSink {
         self.writer
             .finish()
             .map_err(|e| format!("parquet footer: {e}"))?;
+        Ok(self.written)
+    }
+}
+
+/// Writes a scan to a DuckDB file, committing whole blocks at a time.
+///
+/// A block's `blocks` row commits in the same transaction as its `txs` rows, so
+/// a block is done exactly when its rows are durable, and a killed run loses
+/// only the uncommitted tail.
+struct DuckDbSink {
+    conn: Connection,
+    rows: RowBuffer,
+    blocks: Vec<BlockOutcome>,
+    commit_rows: usize,
+    last_commit: Instant,
+    written: u64,
+}
+
+/// Quote a column name; some features contain `|`.
+fn ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+impl DuckDbSink {
+    /// Create `path` holding a new, empty scan over `range`.
+    fn create(path: &Path, range: &ScanRange, columns: &[String]) -> Result<Self, String> {
+        if path.exists() {
+            return Err(format!("{} already exists", path.display()));
+        }
+        let conn = Connection::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let rows = RowBuffer::new(columns);
+        let txs_columns = rows
+            .sql_columns()
+            .iter()
+            .map(|(name, ty)| format!("{} {ty} NOT NULL", ident(name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let chain = range
+            .chain
+            .to_possible_value()
+            .expect("chain variants are not skipped");
+        // The scan row commits on its own, so a run killed before its first
+        // block commit still leaves a resumable file.
+        conn.execute_batch(&format!(
+            "BEGIN;
+             CREATE TABLE scan (
+                 chain VARCHAR NOT NULL,
+                 start_height INTEGER NOT NULL,
+                 end_height INTEGER NOT NULL,
+                 duckdb_version VARCHAR NOT NULL,
+                 started_at TIMESTAMPTZ NOT NULL DEFAULT current_timestamp
+             );
+             CREATE TABLE blocks (
+                 height INTEGER NOT NULL,
+                 hash VARCHAR NOT NULL,
+                 tx_count INTEGER NOT NULL,
+                 \"rows\" INTEGER NOT NULL,
+                 skipped INTEGER NOT NULL
+             );
+             CREATE TABLE txs ({txs_columns});
+             INSERT INTO scan (chain, start_height, end_height, duckdb_version)
+                 VALUES ('{}', {}, {}, version());
+             COMMIT;",
+            chain.get_name(),
+            range.start_height,
+            range.end_height
+        ))
+        .map_err(|e| format!("create tables: {e}"))?;
+        Ok(Self::with(conn, rows))
+    }
+
+    /// Open the unfinished scan in `path` for resuming.
+    ///
+    /// Refuses a file whose `txs` columns differ from `columns`, whose done
+    /// blocks are not one contiguous run down from the end height, or whose
+    /// scan is already complete.
+    fn open(path: &Path, columns: &[String]) -> Result<(Self, ResumeState), String> {
+        // `Connection::open` would silently create a fresh file.
+        if !path.exists() {
+            return Err(format!(
+                "{} does not exist; start a scan with `start`",
+                path.display()
+            ));
+        }
+        let conn = Connection::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let rows = RowBuffer::new(columns);
+
+        let (chain, start_height, end_height): (String, i32, i32) = conn
+            .query_row(
+                "SELECT chain, start_height, end_height FROM scan",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .map_err(|e| format!("read scan: {e}"))?;
+        let chain = CliChainType::from_str(&chain, false)
+            .map_err(|e| format!("stored chain {chain:?}: {e}"))?;
+        let range = ScanRange {
+            chain,
+            start_height,
+            end_height,
+        };
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT column_name, data_type FROM information_schema.columns
+                 WHERE table_name = 'txs' ORDER BY ordinal_position",
+            )
+            .map_err(|e| format!("read txs columns: {e}"))?;
+        let stored: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .and_then(|it| it.collect())
+            .map_err(|e| format!("read txs columns: {e}"))?;
+        drop(stmt);
+        let expected = rows.sql_columns();
+        let same = stored.len() == expected.len()
+            && stored
+                .iter()
+                .zip(&expected)
+                .all(|((name, ty), (want_name, want_ty))| name == want_name && ty == want_ty);
+        if !same {
+            return Err(format!(
+                "{} was written with a different feature schema ({} columns, this binary has {}); start a new scan file",
+                path.display(),
+                stored.len(),
+                expected.len()
+            ));
+        }
+
+        let (min, max, count, distinct): (Option<i32>, Option<i32>, i64, i64) = conn
+            .query_row(
+                "SELECT min(height), max(height), count(*), count(DISTINCT height) FROM blocks",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .map_err(|e| format!("read blocks: {e}"))?;
+        let lowest_done = match (min, max) {
+            (Some(min), Some(max)) => {
+                let contiguous = max == end_height
+                    && count == distinct
+                    && count == (end_height - min + 1) as i64;
+                if !contiguous {
+                    return Err(format!(
+                        "{}: done blocks are not one contiguous run down from height {end_height}",
+                        path.display()
+                    ));
+                }
+                if min == start_height {
+                    return Err(format!("{}: scan is already complete", path.display()));
+                }
+                let hash: String = conn
+                    .query_row("SELECT hash FROM blocks WHERE height = ?", [min], |r| {
+                        r.get(0)
+                    })
+                    .map_err(|e| format!("read block {min}: {e}"))?;
+                Some((min, hash))
+            }
+            _ => None,
+        };
+
+        Ok((Self::with(conn, rows), ResumeState { range, lowest_done }))
+    }
+
+    fn with(conn: Connection, rows: RowBuffer) -> Self {
+        Self {
+            conn,
+            rows,
+            blocks: Vec::new(),
+            commit_rows: COMMIT_ROWS,
+            last_commit: Instant::now(),
+            written: 0,
+        }
+    }
+
+    /// Commit buffered rows together with the blocks they came from.
+    fn commit(&mut self) -> Result<(), String> {
+        if self.blocks.is_empty() {
+            return Ok(());
+        }
+        let n = self.rows.len();
+        let batch = self.rows.take_batch()?;
+        // On error the transaction stays open and is discarded when the
+        // connection drops, so a failed commit leaves nothing behind.
+        self.conn
+            .execute_batch("BEGIN")
+            .map_err(|e| format!("begin: {e}"))?;
+        {
+            let mut txs = self
+                .conn
+                .appender("txs")
+                .map_err(|e| format!("txs appender: {e}"))?;
+            if n > 0 {
+                txs.append_record_batch(batch)
+                    .map_err(|e| format!("append txs: {e}"))?;
+            }
+            // Drop discards flush errors, so flush explicitly.
+            txs.flush().map_err(|e| format!("flush txs: {e}"))?;
+
+            let mut blocks = self
+                .conn
+                .appender("blocks")
+                .map_err(|e| format!("blocks appender: {e}"))?;
+            for b in self.blocks.drain(..) {
+                blocks
+                    .append_row(params![
+                        b.height,
+                        b.hash,
+                        b.tx_count as i32,
+                        b.rows as i32,
+                        b.skipped as i32
+                    ])
+                    .map_err(|e| format!("append block {}: {e}", b.height))?;
+            }
+            blocks.flush().map_err(|e| format!("flush blocks: {e}"))?;
+        }
+        self.conn
+            .execute_batch("COMMIT")
+            .map_err(|e| format!("commit: {e}"))?;
+        self.written += n as u64;
+        self.last_commit = Instant::now();
+        Ok(())
+    }
+}
+
+impl RowSink for DuckDbSink {
+    fn push(
+        &mut self,
+        tx_index: i32,
+        norm: &NormalizedTx,
+        columns: &[String],
+    ) -> Result<(), String> {
+        self.rows.push(tx_index, norm, columns)
+    }
+
+    fn end_block(&mut self, block: &BlockOutcome) -> Result<(), String> {
+        self.blocks.push(block.clone());
+        if self.rows.len() >= self.commit_rows || self.last_commit.elapsed() >= COMMIT_INTERVAL {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Commit the tail and checkpoint, leaving a single file with no WAL.
+    fn finish(mut self: Box<Self>) -> Result<u64, String> {
+        self.commit()?;
+        self.conn
+            .execute_batch("CHECKPOINT")
+            .map_err(|e| format!("checkpoint: {e}"))?;
         Ok(self.written)
     }
 }
@@ -658,7 +977,7 @@ fn analyze_block(
 }
 
 /// What one block contributed to the scan.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct BlockOutcome {
     height: i32,
     hash: String,
@@ -708,7 +1027,7 @@ mod tests {
     use super::*;
 
     /// Synthetic normalized row; `x` must be schema-wide.
-    fn row(i: usize, columns: &[String]) -> NormalizedTx {
+    fn row(height: i32, i: usize, columns: &[String]) -> NormalizedTx {
         let x = columns
             .iter()
             .enumerate()
@@ -723,9 +1042,60 @@ mod tests {
             })
             .collect();
         NormalizedTx {
-            block_height: i as i32,
+            block_height: height,
             x,
         }
+    }
+
+    /// Fresh path for one test's scan file; tests run in parallel, so each uses its own name.
+    fn db_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("kp_duckdb_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{name}.duckdb"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("duckdb.wal"));
+        path
+    }
+
+    fn range(start_height: i32, end_height: i32) -> ScanRange {
+        ScanRange {
+            chain: CliChainType::Regtest,
+            start_height,
+            end_height,
+        }
+    }
+
+    /// Rows per synthetic block: some blocks write none, like coinbase-only ones.
+    fn rows_in(height: i32) -> usize {
+        (height % 3) as usize
+    }
+
+    /// Feed blocks `from` down to `to`, the way `walk` drives the sink.
+    fn feed(sink: &mut DuckDbSink, from: i32, to: i32) {
+        let columns = &schema_ref().columns;
+        for height in (to..=from).rev() {
+            let n = rows_in(height);
+            for i in 0..n {
+                // tx_index 0 is the coinbase, which is never written.
+                sink.push(i as i32 + 1, &row(height, i, columns), columns)
+                    .unwrap();
+            }
+            sink.end_block(&BlockOutcome {
+                height,
+                hash: format!("hash{height}"),
+                tx_count: n as u64 + 1,
+                rows: n as u64,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+    }
+
+    fn count(path: &Path, sql: &str) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row(sql, [], |r| r.get(0))
+            .unwrap()
     }
 
     fn write_rows(path: &Path, n: usize, batch_size: usize) -> DataFrame {
@@ -734,7 +1104,8 @@ mod tests {
         let mut sink: Box<dyn RowSink> =
             Box::new(ParquetSink::new(path, columns, batch_size).unwrap());
         for i in 0..n {
-            sink.push(i as i32 + 1, &row(i, columns), columns).unwrap();
+            sink.push(i as i32 + 1, &row(i as i32, i, columns), columns)
+                .unwrap();
         }
         assert_eq!(sink.finish().unwrap(), n as u64);
 
@@ -782,5 +1153,149 @@ mod tests {
         let df = write_rows(&dir.join("empty.parquet"), 0, 16);
         assert_eq!(df.shape().0, 0);
         assert_eq!(df.width(), schema_ref().columns.len() + 2);
+    }
+
+    /// A scan killed after a few commits and resumed must equal one that ran straight through.
+    #[test]
+    fn resume_matches_uninterrupted_run() {
+        let columns = &schema_ref().columns;
+        let whole = db_path("whole");
+        let mut sink = DuckDbSink::create(&whole, &range(0, 20), columns).unwrap();
+        feed(&mut sink, 20, 0);
+        Box::new(sink).finish().unwrap();
+
+        let split = db_path("split");
+        let mut sink = DuckDbSink::create(&split, &range(0, 20), columns).unwrap();
+        sink.commit_rows = 4;
+        feed(&mut sink, 20, 9);
+        drop(sink); // killed: the uncommitted tail is lost
+
+        let (mut sink, state) = DuckDbSink::open(&split, columns).unwrap();
+        let (lowest, hash) = state.lowest_done.expect("some blocks committed");
+        assert!(
+            lowest > 9,
+            "the tail after the last commit must not be done"
+        );
+        assert_eq!(hash, format!("hash{lowest}"));
+        feed(&mut sink, lowest - 1, 0);
+        Box::new(sink).finish().unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "ATTACH '{}' AS a (READ_ONLY); ATTACH '{}' AS b (READ_ONLY);",
+            whole.display(),
+            split.display()
+        ))
+        .unwrap();
+        for table in ["txs", "blocks"] {
+            let diff: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT (SELECT count(*) FROM (FROM a.{table} EXCEPT ALL FROM b.{table}))
+                              + (SELECT count(*) FROM (FROM b.{table} EXCEPT ALL FROM a.{table}))"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(diff, 0, "{table} differs after resume");
+        }
+        let rows: i64 = (0..=20).map(|h| rows_in(h) as i64).sum();
+        assert_eq!(count(&split, "SELECT count(*) FROM txs"), rows);
+    }
+
+    /// Rows and blocks pushed after the last commit leave no trace when the run dies.
+    #[test]
+    fn uncommitted_batch_leaves_nothing() {
+        let columns = &schema_ref().columns;
+        let path = db_path("uncommitted");
+        let mut sink = DuckDbSink::create(&path, &range(0, 10), columns).unwrap();
+        feed(&mut sink, 10, 0);
+        drop(sink);
+
+        assert_eq!(count(&path, "SELECT count(*) FROM txs"), 0);
+        assert_eq!(count(&path, "SELECT count(*) FROM blocks"), 0);
+        // With nothing committed, resume restarts at the end height.
+        let (_, state) = DuckDbSink::open(&path, columns).unwrap();
+        assert!(state.lowest_done.is_none());
+        assert_eq!(state.range.end_height, 10);
+    }
+
+    /// Blocks that write no rows still count as done.
+    #[test]
+    fn zero_row_blocks_are_done() {
+        let columns = &schema_ref().columns;
+        let path = db_path("zero_rows");
+        let mut sink = DuckDbSink::create(&path, &range(0, 5), columns).unwrap();
+        for height in (0..=5).rev() {
+            sink.end_block(&BlockOutcome {
+                height,
+                hash: format!("hash{height}"),
+                tx_count: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        }
+        assert_eq!(Box::new(sink).finish().unwrap(), 0);
+        assert_eq!(count(&path, "SELECT count(*) FROM blocks"), 6);
+        assert_eq!(count(&path, "SELECT count(*) FROM txs"), 0);
+    }
+
+    #[test]
+    fn start_refuses_existing_file() {
+        let columns = &schema_ref().columns;
+        let path = db_path("exists");
+        Box::new(DuckDbSink::create(&path, &range(0, 1), columns).unwrap())
+            .finish()
+            .unwrap();
+        let err = DuckDbSink::create(&path, &range(0, 1), columns)
+            .err()
+            .unwrap();
+        assert!(err.contains("already exists"), "{err}");
+    }
+
+    fn open_err(path: &Path) -> String {
+        DuckDbSink::open(path, &schema_ref().columns).err().unwrap()
+    }
+
+    #[test]
+    fn resume_refuses_missing_file() {
+        assert!(open_err(&db_path("missing")).contains("does not exist"));
+    }
+
+    #[test]
+    fn resume_refuses_complete_scan() {
+        let columns = &schema_ref().columns;
+        let path = db_path("complete");
+        let mut sink = DuckDbSink::create(&path, &range(0, 5), columns).unwrap();
+        feed(&mut sink, 5, 0);
+        Box::new(sink).finish().unwrap();
+        assert!(open_err(&path).contains("already complete"));
+    }
+
+    #[test]
+    fn resume_refuses_schema_drift() {
+        let columns = &schema_ref().columns;
+        let path = db_path("drift");
+        drop(DuckDbSink::create(&path, &range(0, 5), columns).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("ALTER TABLE txs DROP COLUMN fp_version")
+            .unwrap();
+        assert!(open_err(&path).contains("different feature schema"));
+    }
+
+    #[test]
+    fn resume_refuses_gap_in_done_blocks() {
+        let columns = &schema_ref().columns;
+        let path = db_path("gap");
+        let mut sink = DuckDbSink::create(&path, &range(0, 10), columns).unwrap();
+        feed(&mut sink, 10, 5);
+        Box::new(sink).finish().unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("DELETE FROM blocks WHERE height = 7")
+            .unwrap();
+        assert!(open_err(&path).contains("not one contiguous run"));
     }
 }
