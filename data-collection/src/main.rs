@@ -10,12 +10,12 @@ use std::time::{Duration, Instant};
 
 use analysis::normalize::{INT_COLUMNS, NormalizedTx};
 use analysis::{
-    analyze_tx, bitcoin_tx_from_bytes, normalize_tx, prevouts_from_kernel_coins, schema,
-    schema_ref, BlockTxContext,
+    BlockTxContext, analyze_tx, bitcoin_tx_from_bytes, normalize_tx, prevouts_from_kernel_coins,
+    schema, schema_ref,
 };
 use bitcoinkernel::{
-    prelude::*, BlockTreeEntry, ChainType, ChainstateManager, ChainstateManagerBuilder, Context,
-    ContextBuilder,
+    BlockTreeEntry, ChainType, ChainstateManager, ChainstateManagerBuilder, Context,
+    ContextBuilder, prelude::*,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use polars::prelude::*;
@@ -437,7 +437,11 @@ impl ParquetRows {
     /// Column order must match [`ParquetRows::polars_schema`].
     fn take_frame(&mut self) -> Result<DataFrame, String> {
         let mut cols: Vec<Column> = vec![
-            Series::new("block_height".into(), std::mem::take(&mut self.block_height)).into(),
+            Series::new(
+                "block_height".into(),
+                std::mem::take(&mut self.block_height),
+            )
+            .into(),
         ];
         for (name, values) in self.int_names.iter().zip(self.int_cols.iter_mut()) {
             cols.push(Series::new(name.as_str().into(), std::mem::take(values)).into());
@@ -489,7 +493,6 @@ impl ParquetSink {
         self.written += n as u64;
         Ok(())
     }
-
 }
 
 impl RowSink for ParquetSink {
@@ -696,7 +699,9 @@ mod tests {
         }
         assert_eq!(sink.finish().unwrap(), n as u64);
 
-        ParquetReader::new(File::open(path).unwrap()).finish().unwrap()
+        ParquetReader::new(File::open(path).unwrap())
+            .finish()
+            .unwrap()
     }
 
     /// Row-group size must not change the data that comes back out.
