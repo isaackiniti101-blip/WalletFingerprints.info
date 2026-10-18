@@ -193,10 +193,9 @@ fn encode_into(tx: &TxAnalysis, b: &mut FeatureBuilder) {
     b.push_bool("h_uih1", h.uih1);
     b.push_bool("h_uih2", h.uih2);
 
-    let prevout_types = unique_by(
-        tx.fingerprints.inputs.iter().map(|i| i.input_type),
-        |x| x as u8,
-    );
+    let prevout_types = unique_by(tx.fingerprints.inputs.iter().map(|i| i.input_type), |x| {
+        x as u8
+    });
     let input_types = unique_by(raw.inputs.iter().map(|i| i.input_type), |x| x as u8);
     let output_types = unique_by(raw.outputs.iter().map(|o| o.output_type), |x| x as u8);
     b.push_multi_hot("prevout_type", &prevout_types);
@@ -286,7 +285,7 @@ mod tests {
     /// `cargo run -- schema | jq -r '.columns[]' > src/analysis/schema_columns.txt`
     const GOLDEN: &str = include_str!("schema_columns.txt");
 
-    /// The feature vector's column order is a wire format: every Parquet file
+    /// The feature vector's column order is a wire format: every scan file
     /// ever written is only interpretable against it. Reordering or renaming a
     /// column silently invalidates historical output, so it has to be a
     /// deliberate, reviewed change to the golden file.
@@ -307,8 +306,7 @@ mod tests {
         );
     }
 
-    /// Duplicate names would make a column ambiguous downstream (and Parquet
-    /// would happily write both).
+    /// Duplicate names would make a column ambiguous downstream.
     #[test]
     fn schema_columns_are_unique() {
         let cols = &schema_ref().columns;

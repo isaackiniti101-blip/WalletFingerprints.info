@@ -95,7 +95,6 @@ pub enum OutputStructure {
     Unknown = 3,
 }
 
-
 impl From<tx_indexer_fingerprints::types::OutputStructureType> for OutputStructure {
     fn from(t: tx_indexer_fingerprints::types::OutputStructureType) -> Self {
         match t {
@@ -140,7 +139,6 @@ pub enum RawInputType {
     CoinbaseWitness = 15,
     Unknown = 16,
 }
-
 
 impl From<rawtx_rs::input::InputType> for RawInputType {
     fn from(t: rawtx_rs::input::InputType) -> Self {
@@ -217,7 +215,6 @@ pub enum RawOutputType {
     OpReturnHathorNetwork = 31,
     OpReturnRunestone = 32,
 }
-
 
 impl From<rawtx_rs::output::OutputType> for RawOutputType {
     fn from(t: rawtx_rs::output::OutputType) -> Self {
@@ -303,7 +300,6 @@ pub enum SighashType {
     Unknown = 0xff,
 }
 
-
 impl SighashType {
     pub fn from_flag(flag: u8) -> Self {
         match flag {
@@ -348,7 +344,6 @@ pub enum SchnorrSighashForm {
     ExplicitOther = 2,
 }
 
-
 impl SchnorrSighashForm {
     pub fn from_sig_bytes(sig: &[u8]) -> Option<Self> {
         match sig.len() {
@@ -381,7 +376,6 @@ pub enum TaprootSpendPath {
     Script = 2,
 }
 
-
 impl fmt::Display for TaprootSpendPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -399,7 +393,6 @@ pub enum SigAlgo {
     Schnorr = 1,
 }
 
-
 impl fmt::Display for SigAlgo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -415,7 +408,6 @@ pub enum PubkeyAlgo {
     Ecdsa = 0,
     Schnorr = 1,
 }
-
 
 impl From<rawtx_rs::script::PubkeyType> for PubkeyAlgo {
     fn from(t: rawtx_rs::script::PubkeyType) -> Self {
@@ -455,7 +447,6 @@ pub enum DerEncoding {
     NegativeSValue = 14,
     NullByteAtSValueStart = 15,
 }
-
 
 impl From<&rawtx_rs::script::DEREncoding> for DerEncoding {
     fn from(d: &rawtx_rs::script::DEREncoding) -> Self {
@@ -555,7 +546,6 @@ pub enum CpfpRole {
     Both = 3,
 }
 
-
 impl fmt::Display for CpfpRole {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -574,7 +564,6 @@ pub enum ChangeHeuristic {
     OptimalChange = 1,
     ScriptTypeMatch = 2,
 }
-
 
 impl fmt::Display for ChangeHeuristic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -636,7 +625,6 @@ pub enum SequenceShape {
     Other = 5,
 }
 
-
 impl SequenceShape {
     const DISABLE_FLAG: u32 = 1 << 31;
     const TYPE_FLAG: u32 = 1 << 22;
@@ -691,7 +679,6 @@ pub enum LocktimeShape {
     /// Unix-timestamp locktime (≥ 500_000_000).
     Timestamp = 7,
 }
-
 
 impl LocktimeShape {
     const HEIGHT_THRESHOLD: u32 = 500_000_000;

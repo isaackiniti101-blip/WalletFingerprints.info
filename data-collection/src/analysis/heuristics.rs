@@ -3,10 +3,10 @@
 use bitcoin::{Transaction, TxOut};
 use serde::{Deserialize, Serialize};
 
+use super::BlockTxContext;
 use super::fingerprints::FingerprintFeatures;
 use super::rawtx::{MultisigInfo, RawTxFeatures};
 use super::types::{CpfpRole, LocktimeShape, PubkeyAlgo, SequenceShape, SighashType};
-use super::BlockTxContext;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct HeuristicFeatures {
