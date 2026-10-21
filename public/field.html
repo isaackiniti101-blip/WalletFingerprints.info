@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Is My Wallet Unique?</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:ital,wght@0,400;0,500;1,400&display=swap">
+<link rel="stylesheet" href="style.css?v=26">
+</head>
+<body>
+<header>
+  <div class="mast">
+    <h1>Is My Wallet Unique?</h1>
+    <p id="window"></p>
+  </div>
+  <div class="tools">
+    <nav class="site" aria-label="Site">
+      <a href="field.html" class="on">Field</a>
+      <a href="graph.html">Graph</a>
+    </nav>
+    <div class="modes">
+      <button type="button" id="mode-scale" class="on">True scale</button>
+      <button type="button" id="mode-side">Side by side</button>
+    </div>
+    <div class="scale-readout" id="scale-readout"></div>
+  </div>
+  <div class="legend" id="legend"></div>
+</header>
+<nav class="ladder" id="ladder" aria-label="Granularity"></nav>
+<main>
+  <canvas id="field"></canvas>
+</main>
+<aside>
+  <section id="readout">
+    <p class="kicker">Selection</p>
+    <h1 id="sel-title">All transactions</h1>
+    <p class="ratio" id="sel-ratio"></p>
+    <p class="share" id="sel-share"></p>
+    <p class="note" id="sel-note"></p>
+    <div class="mix" id="sel-mix"></div>
+    <dl id="sel-attrs"></dl>
+  </section>
+  <section>
+    <p class="kicker">Labeled fingerprints</p>
+    <form id="label-form">
+      <input id="label-name" type="text" maxlength="40" placeholder="Name this selection" autocomplete="off">
+      <button type="submit">Set label</button>
+    </form>
+    <ul id="labels"></ul>
+  </section>
+  <section>
+    <p class="kicker">Filter</p>
+    <div class="join" id="join" role="group" aria-label="Combine filters">
+      <button type="button" id="join-and" class="on">And</button>
+      <button type="button" id="join-or">Or</button>
+    </div>
+    <div id="filters"></div>
+  </section>
+</aside>
+<script src="print.js?v=4"></script>
+<script src="app.js?v=12"></script>
+</body>
+</html>
